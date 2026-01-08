@@ -1,6 +1,6 @@
 # RP2040_ADC_Calibrator
 
-The RP2040 ADC has documented nonlinearities due to a production issue.  This pico-arduino sketch can be used to self-calibrate an ADC to help to linearise the readings.  
+The RP2040 ADC has documented nonlinearities due to a production issue (see section 4.9.4 of the datasheet).  This pico-arduino sketch can be used to self-calibrate an ADC to help to linearise the readings.  
 
 The firmware creates a DC signal using delta-sigma modulation and an external filter.  This signal scans the ADC, and the scan is used to create a table of corrections that is saved to flash.  An application can load this table, and use it to correct the nonlinearities of the ADC.
 
