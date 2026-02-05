@@ -15,7 +15,7 @@
 #define ADC_PIN             29
 #define ADC_CHAN            3
 
-#define SAMPLES_PER_LEVEL   c      // Samples at each DAC level
+#define SAMPLES_PER_LEVEL   256      // Samples at each DAC level
 #define NUM_SWEEPS          4      // Up/down sweeps (averages hysteresis)
 #define SETTLE_US           1000     // Settling time after level change
 
