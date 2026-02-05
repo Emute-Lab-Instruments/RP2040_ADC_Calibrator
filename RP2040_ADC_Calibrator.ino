@@ -2,7 +2,7 @@
 // RP2040 ADC Calibration using PIO Sigma-Delta DAC
 // 
 // Hardware setup:
-//   Pin 2 (DAC) -> Sallen-Key filter (20kHz cutoff) -> ADC
+//   Pins 5, 6, 7 (DACs, all same value) -> Mixed -> Sallen-Key filter (20kHz cutoff) -> ADC
 
 #include <LittleFS.h>
 #include "hardware/pio.h"
@@ -11,12 +11,14 @@
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
-#define DAC_PIN             3
+#define DAC_PIN_1           5
+#define DAC_PIN_2           6
+#define DAC_PIN_3           7
 #define ADC_PIN             29
 #define ADC_CHAN            3
 
-#define SAMPLES_PER_LEVEL   c      // Samples at each DAC level
-#define NUM_SWEEPS          4      // Up/down sweeps (averages hysteresis)
+#define SAMPLES_PER_LEVEL   256      // Samples at each DAC level
+#define NUM_SWEEPS          4        // Up/down sweeps (averages hysteresis)
 #define SETTLE_US           1000     // Settling time after level change
 
 // -----------------------------------------------------------------------------
@@ -33,12 +35,19 @@ static CalibrationData cal_data;
 static uint32_t histogram[4096];
 
 // -----------------------------------------------------------------------------
-// PIO Sigma-Delta DAC
+// PIO Sigma-Delta DAC (Multi-channel)
 // -----------------------------------------------------------------------------
-static PIO sd_pio;
-static uint sd_sm;
-static uint32_t sd_accumulator = 0;
-static uint32_t sd_target = 0;
+#define NUM_DACS 3
+
+typedef struct {
+    PIO pio;
+    uint sm;
+    uint pin;
+    uint32_t accumulator;
+    uint32_t target;
+} SigmaDeltaDAC;
+
+static SigmaDeltaDAC dacs[NUM_DACS];
 
 // PIO program: just output bits from FIFO
 // Assembly: .wrap_target
@@ -51,21 +60,29 @@ static const struct pio_program sd_program = {
     .origin = -1
 };
 
-bool dac_init(uint pin) {
-    sd_pio = pio0;
+bool dac_init_channel(uint channel, uint pin) {
+    if (channel >= NUM_DACS) return false;
     
-    int sm = pio_claim_unused_sm(sd_pio, false);
+    SigmaDeltaDAC *dac = &dacs[channel];
+    dac->pin = pin;
+    dac->accumulator = 0;
+    dac->target = 0;
+    
+    // Try PIO0 first, then PIO1
+    dac->pio = pio0;
+    int sm = pio_claim_unused_sm(dac->pio, false);
     if (sm < 0) {
-        sd_pio = pio1;
-        sm = pio_claim_unused_sm(sd_pio, false);
+        dac->pio = pio1;
+        sm = pio_claim_unused_sm(dac->pio, false);
     }
     if (sm < 0) {
-        Serial.printf("ERROR: No PIO state machine available\n");
+        Serial.printf("ERROR: No PIO state machine available for DAC channel %d\n", channel);
         return false;
     }
-    sd_sm = (uint)sm;
+    dac->sm = (uint)sm;
     
-    uint offset = pio_add_program(sd_pio, &sd_program);
+    // Add program if not already added to this PIO
+    uint offset = pio_add_program(dac->pio, &sd_program);
     
     pio_sm_config c = pio_get_default_sm_config();
     sm_config_set_wrap(&c, offset, offset);
@@ -75,28 +92,49 @@ bool dac_init(uint pin) {
     // 488 kHz bit rate - well above 20kHz filter, CPU can keep up
     sm_config_set_clkdiv(&c, 256.0f);
     
-    pio_gpio_init(sd_pio, pin);
-    pio_sm_set_consecutive_pindirs(sd_pio, sd_sm, pin, 1, true);
+    pio_gpio_init(dac->pio, pin);
+    pio_sm_set_consecutive_pindirs(dac->pio, dac->sm, pin, 1, true);
     
-    pio_sm_init(sd_pio, sd_sm, offset, &c);
-    pio_sm_set_enabled(sd_pio, sd_sm, true);
+    pio_sm_init(dac->pio, dac->sm, offset, &c);
+    pio_sm_set_enabled(dac->pio, dac->sm, true);
+    
+    Serial.printf("  DAC channel %d ready (PIO%d SM%d on pin %d)\n", 
+                  channel, pio_get_index(dac->pio), dac->sm, pin);
     
     return true;
 }
 
-void dac_set_level(uint16_t level_12bit) {
-    sd_target = ((uint32_t)(level_12bit & 0xFFF)) << 20;
+bool dac_init() {
+    Serial.printf("Initializing sigma-delta DACs...\n");
+    
+    if (!dac_init_channel(0, DAC_PIN_1)) return false;
+    if (!dac_init_channel(1, DAC_PIN_2)) return false;
+    if (!dac_init_channel(2, DAC_PIN_3)) return false;
+    
+    return true;
 }
 
-// Generate and push one 32-bit word of sigma-delta data
-bool dac_feed_one() {
-    if (pio_sm_is_tx_fifo_full(sd_pio, sd_sm)) {
+// Set all three DACs to the same level
+void dac_set_level(uint16_t level_12bit) {
+    uint32_t target = ((uint32_t)(level_12bit & 0xFFF)) << 20;
+    for (uint ch = 0; ch < NUM_DACS; ch++) {
+        dacs[ch].target = target;
+    }
+}
+
+// Generate and push one 32-bit word of sigma-delta data for a channel
+bool dac_feed_one_channel(uint channel) {
+    if (channel >= NUM_DACS) return false;
+    
+    SigmaDeltaDAC *dac = &dacs[channel];
+    
+    if (pio_sm_is_tx_fifo_full(dac->pio, dac->sm)) {
         return false;
     }
     
     uint32_t word = 0;
-    uint32_t target = sd_target;
-    uint32_t acc = sd_accumulator;
+    uint32_t target = dac->target;
+    uint32_t acc = dac->accumulator;
     
     for (int i = 0; i < 32; i++) {
         uint32_t old_acc = acc;
@@ -106,24 +144,35 @@ bool dac_feed_one() {
         }
     }
     
-    sd_accumulator = acc;
-    pio_sm_put(sd_pio, sd_sm, word);
+    dac->accumulator = acc;
+    pio_sm_put(dac->pio, dac->sm, word);
     return true;
 }
 
-// Feed FIFO until full
-void dac_feed() {
-    for (int i = 0; i < 8; i++) {
-        if (!dac_feed_one()) break;
+// Feed all DAC channels (call this regularly to keep them running)
+void dac_feed_all() {
+    for (uint ch = 0; ch < NUM_DACS; ch++) {
+        for (int i = 0; i < 8; i++) {
+            if (!dac_feed_one_channel(ch)) break;
+        }
     }
 }
 
-// Set level and wait for settling (keeps feeding DAC)
+// Convenience: feed one iteration (for backward compatibility)
+bool dac_feed_one() {
+    return dac_feed_one_channel(0);  // Just feed first channel once
+}
+
+void dac_feed() {
+    dac_feed_all();  // Feed all channels
+}
+
+// Set all DACs to level and wait for settling (keeps feeding all DACs)
 void dac_set_and_settle(uint16_t level, uint32_t settle_us) {
     dac_set_level(level);
     uint32_t start = time_us_32();
     while (time_us_32() - start < settle_us) {
-        dac_feed_one();
+        dac_feed_all();
     }
 }
 
@@ -139,7 +188,7 @@ void adc_cal_init() {
 uint16_t adc_read_averaged(uint32_t num_samples) {
     uint32_t sum = 0;
     for (uint32_t i = 0; i < num_samples; i++) {
-        dac_feed_one();  // Keep DAC running
+        dac_feed_all();  // Keep all DACs running
         sum += adc_read();
     }
     return (sum + num_samples / 2) / num_samples;
@@ -162,7 +211,7 @@ void collect_histogram_sweep(bool ascending) {
         
         // Collect samples at this level
         for (int s = 0; s < SAMPLES_PER_LEVEL; s++) {
-            dac_feed_one();
+            dac_feed_all();
             uint16_t code = adc_read();
             if (code < 4096) {
                 histogram[code]++;
@@ -263,7 +312,7 @@ static inline uint16_t adc_corrected(uint16_t raw) {
 uint16_t adc_read_calibrated(uint32_t oversample) {
     uint32_t sum = 0;
     for (uint32_t i = 0; i < oversample; i++) {
-        dac_feed_one();
+        dac_feed_all();
         uint16_t raw = adc_read();
         sum += adc_corrected(raw);
     }
@@ -360,7 +409,7 @@ void verify_calibration() {
         // Read raw and corrected
         uint32_t raw_sum = 0, corr_sum = 0;
         for (int s = 0; s < 256; s++) {
-            dac_feed_one();
+            dac_feed_all();
             uint16_t raw = adc_read();
             raw_sum += raw;
             corr_sum += adc_corrected(raw);
@@ -399,7 +448,7 @@ void quick_test() {
 }
 
 void setDAC(int level) {
-    Serial.printf("=== DAC: %d ===\n", level);
+    Serial.printf("=== All DACs: %d ===\n", level);
     
     dac_set_and_settle(level, 5000);
     
@@ -407,6 +456,15 @@ void setDAC(int level) {
     int error = (int)adc_val - (int)level;
     Serial.printf("  DAC=%4d -> ADC=%4d (error %+d)\n", level, adc_val, error);
     
+    Serial.println();
+}
+
+void show_dac_status() {
+    Serial.printf("\n=== DAC Status (all tracking same value) ===\n");
+    Serial.printf("  Current level: %d\n", dacs[0].target >> 20);
+    Serial.printf("  Pin %d: %d\n", DAC_PIN_1, dacs[0].target >> 20);
+    Serial.printf("  Pin %d: %d\n", DAC_PIN_2, dacs[1].target >> 20);
+    Serial.printf("  Pin %d: %d\n", DAC_PIN_3, dacs[2].target >> 20);
     Serial.println();
 }
 
@@ -420,7 +478,8 @@ void run_calibration() {
     Serial.printf("║     Sigma-Delta DAC Method             ║\n");
     Serial.printf("╚════════════════════════════════════════╝\n\n");
     
-    Serial.printf("Hardware: Pin %d (DAC) -> Filter -> Pin %d (ADC)\n\n", DAC_PIN, ADC_PIN);
+    Serial.printf("Hardware: Pins %d,%d,%d (DACs) -> Mix -> Filter -> Pin %d (ADC)\n\n", 
+                  DAC_PIN_1, DAC_PIN_2, DAC_PIN_3, ADC_PIN);
     
     quick_test();
     
@@ -442,19 +501,22 @@ void setup() {
     
     Serial.printf("\n\nInitializing...\n");
     
-    // Initialize DAC
-    if (!dac_init(DAC_PIN)) {
+    // Initialize all three sigma-delta DACs
+    if (!dac_init()) {
         Serial.printf("DAC init failed!\n");
         while(1) delay(1000);
     }
-    Serial.printf("  DAC ready (PIO sigma-delta on pin %d)\n", DAC_PIN);
     
-    // Prime DAC FIFO
+    // Set all DACs to 0
     dac_set_level(0);
+    
+    // Prime all DAC FIFOs
     for (int i = 0; i < 100; i++) {
-        dac_feed();
+        dac_feed_all();
         delayMicroseconds(100);
     }
+    
+    Serial.printf("\nAll DACs initialized and set to 0\n");
     
     // Initialize ADC
     adc_cal_init();
@@ -471,8 +533,8 @@ void setup() {
 }
 
 void loop() {
-    // Keep DAC running
-    dac_feed();
+    // Keep all DACs running
+    dac_feed_all();
     
     // Check for serial commands
     if (Serial.available()) {
@@ -494,6 +556,10 @@ void loop() {
             case 'D':
                 dump_csv_to_serial();
                 break;
+            case 's':
+            case 'S':
+                show_dac_status();
+                break;
             case 'h':
             case 'H':
             case '?':
@@ -502,6 +568,7 @@ void loop() {
                 Serial.printf("  t - Quick test\n");
                 Serial.printf("  v - Verify calibration\n");
                 Serial.printf("  d - Dump CSV to serial\n");
+                Serial.printf("  s - Show DAC status\n");
                 Serial.printf("  h - This help\n\n");
                 break;
             case 'n':
