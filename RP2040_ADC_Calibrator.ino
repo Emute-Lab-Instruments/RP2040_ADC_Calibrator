@@ -19,6 +19,8 @@
 #define NUM_SWEEPS          4      // Up/down sweeps (averages hysteresis)
 #define SETTLE_US           1000     // Settling time after level change
 
+#define LEDPIN 22
+
 // -----------------------------------------------------------------------------
 // Calibration data structures
 // -----------------------------------------------------------------------------
@@ -156,7 +158,7 @@ void collect_histogram_sweep(bool ascending) {
     int step = ascending ? 1 : -1;
     
     int progress_step = 512;
-    
+    bool ledOn=0;
     for (int level = start; ascending ? (level <= end) : (level >= end); level += step) {
         dac_set_and_settle(level, SETTLE_US);
         
@@ -171,6 +173,8 @@ void collect_histogram_sweep(bool ascending) {
         
         // Progress indicator
         if (level % progress_step == 0) {
+            ledOn = !ledOn;
+            digitalWrite(LEDPIN, ledOn);
             Serial.printf("%d ", level);
         }
     }
@@ -182,8 +186,9 @@ void collect_histogram() {
     
     Serial.printf("Collecting histogram (%d sweeps, %d samples/level)...\n", 
                   NUM_SWEEPS, SAMPLES_PER_LEVEL);
-    
+
     for (int sweep = 0; sweep < NUM_SWEEPS; sweep++) {
+        
         collect_histogram_sweep(sweep % 2 == 0);  // Alternate up/down
     }
     
@@ -350,7 +355,7 @@ void verify_calibration() {
     Serial.printf("------+----------+----------+----------\n");
     
     const int test_points[] = {5, 10, 25, 50, 75, 90, 95};
-    
+    int correctionSum=0;
     for (int i = 0; i < 7; i++) {
         uint32_t dac_level = (test_points[i] * 4095) / 100;
         uint32_t expected = dac_level;
@@ -370,9 +375,18 @@ void verify_calibration() {
         
         int32_t raw_error = (int32_t)raw_avg - expected;
         int32_t corr_error = (int32_t)corr_avg - expected;
+        correctionSum += std::abs(corr_error);
         
         Serial.printf(" %2d%%  | %4d     | %4d (%+3d) | %4d (%+3d)\n",
                       test_points[i], expected, raw_avg, raw_error, corr_avg, corr_error);
+    }
+
+    if (correctionSum < 10) {
+        digitalWrite(LEDPIN, 1);
+
+    }else{
+        digitalWrite(LEDPIN, 0);
+
     }
     
     dac_set_level(0);
@@ -437,6 +451,7 @@ void run_calibration() {
 // Main
 // -----------------------------------------------------------------------------
 void setup() {
+    pinMode(LEDPIN, 1);
     Serial.begin(115200);
     while (!Serial) { delay(10); }
     
