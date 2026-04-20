@@ -21,6 +21,9 @@
 
 #define LEDPIN 22
 
+enum LEDMODES {FLASH, OFF, SOLID};
+LEDMODES ledMode = LEDMODES::FLASH;
+
 // -----------------------------------------------------------------------------
 // Calibration data structures
 // -----------------------------------------------------------------------------
@@ -381,12 +384,10 @@ void verify_calibration() {
                       test_points[i], expected, raw_avg, raw_error, corr_avg, corr_error);
     }
 
-    if (correctionSum < 10) {
-        digitalWrite(LEDPIN, 1);
-
+    if (correctionSum < 12) {
+        ledMode = LEDMODES::SOLID;
     }else{
-        digitalWrite(LEDPIN, 0);
-
+        ledMode = LEDMODES::OFF;
     }
     
     dac_set_level(0);
@@ -452,8 +453,9 @@ void run_calibration() {
 // -----------------------------------------------------------------------------
 void setup() {
     pinMode(LEDPIN, 1);
+    pinMode(0, INPUT_PULLUP);
     Serial.begin(115200);
-    while (!Serial) { delay(10); }
+    // while (!Serial) { delay(10); }
     
     Serial.printf("\n\nInitializing...\n");
     
@@ -480,15 +482,38 @@ void setup() {
         Serial.printf("Using existing calibration. Send 'c' to recalibrate.\n\n");
         verify_calibration();
     } else {
-        Serial.printf("No calibration found. Running calibration...\n");
-        run_calibration();
+        // Serial.printf("No calibration found. Running calibration...\n");
+        // run_calibration();
     }
 }
-
+size_t LEDTS = 0;
+bool ledTracker=1;
 void loop() {
     // Keep DAC running
     dac_feed();
-    
+
+    auto now = millis();
+
+    switch(ledMode) {
+        case FLASH: {
+            if (now - LEDTS > 50) {
+                LEDTS = now;
+                ledTracker  = !ledTracker;
+                digitalWrite(22, ledTracker);
+            }
+            break;
+        }
+        case OFF:
+            digitalWrite(LEDPIN, 0);
+            break;
+        case SOLID:
+            digitalWrite(LEDPIN, 1);
+            break;
+    }
+    if (digitalRead(0) == 0) { //inverted button
+        Serial.println("button press");
+        run_calibration();
+    }
     // Check for serial commands
     if (Serial.available()) {
         char cmd = Serial.read();
